@@ -1,0 +1,11 @@
+.Rhistory
+.RData
+.RDataTmp
+.Rproj.user/
+.Renviron
+.DS_Store
+*.log
+*.sqlite
+*.sqlite3
+output/
+!output/sql/

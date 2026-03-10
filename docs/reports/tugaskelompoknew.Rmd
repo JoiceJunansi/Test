@@ -1,0 +1,591 @@
+---
+title: "rugas_kelompok"
+author: "Joice Junansi"
+date: "2026-02-17"
+output: html_document
+---
+
+## Persiapan
+
+```{r}
+library(readr)
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(data.table)
+library(jsonlite)
+```
+
+#### Baca dataset
+
+```{r}
+df <- read_csv("dataset/Dataset_Klinik_Raw.csv")
+```
+
+# 2. Tahapan Cleaning & Wrangling
+
+![]()
+
+```{r}
+dt <- as.data.table(df)
+```
+
+mengubah dataset menjadi data table dengan tujuan agar proses data besar menjadi lebih cepat dan praktis.
+
+```{r}
+clean_text <- function(x) {
+  y <- trimws(as.character(x)) #utk menghapus spasi di awal/akhir karakter
+  y[y == ""] <- NA_character_ #utk mengubah kolom missing menjadi NA
+  y
+}
+```
+
+fungsi clean_text untuk membersihkan kolom text sehingga bisa konsisten.
+
+```{r}
+safe_from_json <- function(x, numeric = FALSE) {
+  obj <- tryCatch(fromJSON(x), error = function(e) NULL)
+  if (is.null(obj)) return(if (numeric) numeric(0) else character(0))
+  obj <- unlist(obj, recursive = TRUE, use.names = FALSE)
+  if (length(obj) == 0) return(if (numeric) numeric(0) else character(0))
+  if (numeric) suppressWarnings(as.numeric(obj)) else as.character(obj)
+}
+```
+
+Fungsi safe_from_json() dipakai untuk **mengubah string JSON di kolom dataset menjadi vector.** untuk parsing kolom JSON supaya cleaning/wrangling/normalisasi bisa jalan tanpa gagal karena format data.
+
+```{r}
+parse_json_col <- function(x, numeric = FALSE) {
+  x <- clean_text(x)
+  x[is.na(x)] <- "[]"
+  ux <- unique(x)
+  parsed <- lapply(ux, safe_from_json, numeric = numeric)
+  parsed[match(x, ux)]
+}
+```
+
+Fungsi parse_json_col() dipakai untuk **mem-parse satu kolom JSON secara efisien untuk semua baris**.
+
+Kegunaannya:
+
+1.  Membersihkan teks dulu (clean_text).
+
+2.  Nilai kosong/NA diubah jadi "[]" agar aman diparse.
+
+3.  Ambil nilai unik (ux \<- unique(x)) supaya parsing tidak berulang-ulang.
+
+4.  Parse tiap nilai unik sekali saja ([lapply(ux, safe_from_json, ...)](app://-/index.html# "lapply(ux, safe_from_json, ...)")).
+
+5.  Kembalikan hasil ke urutan baris asli (parsed[match(x, ux)]).
+
+Outputnya adalah **list per baris**:
+
+-   tiap elemen list = vector hasil parse JSON dari baris itu.
+
+-   numeric=TRUE untuk kolom angka (treatment_fee, medicine_unit_price, dll).
+
+-   numeric=FALSE untuk kolom teks (diagnosis, treatment, medicine_name, dll).
+
+Intinya: lebih cepat dan aman untuk dataset besar, karena JSON yang sama tidak diparse berkali-kali.
+
+```{r}
+safe_median <- function(x) {
+  x <- x[!is.na(x)]
+  if (length(x) == 0) return(NA_real_)
+  median(x)
+}
+```
+
+\
+Fungsi safe_median() untuk menghitung median secara aman saat ada nilai hilang.
+
+Cara kerjanya:
+
+1.  x \<- x[!is.na(x)]\
+    buang semua NA.
+
+2.  if (length(x) == 0) return(NA_real\_)\
+    kalau setelah dibuang ternyata kosong, kembalikan NA (tipe numeric).
+
+3.  median(x)\
+    kalau masih ada data, hitung median normal.
+
+Tujuan: mencegah error/hasil tidak jelas saat satu grup datanya semua NA.
+
+```{r}
+build_list_table <- function(visit_ids, seq_name, ...) {
+  list_cols <- list(...)
+  col_names <- names(list_cols)
+
+  data.table::rbindlist(lapply(seq_along(visit_ids), function(i) {
+    lens <- vapply(list_cols, function(L) length(L[[i]]), integer(1))
+    n <- max(lens)
+    if (n == 0) return(NULL)
+
+    out <- data.table::data.table(
+      visit_id = rep(visit_ids[i], n)
+    )
+    out[, (seq_name) := seq_len(n)]
+
+    for (k in seq_along(list_cols)) {
+      v <- list_cols[[k]][[i]]
+      tmp <- rep(NA, n)
+      if (length(v) > 0) tmp[seq_along(v)] <- v
+      out[, (col_names[k]) := tmp]
+    }
+    out
+  }), fill = TRUE, use.names = TRUE)
+}
+```
+
+Fungsi build_list_table() dipakai untuk **mengubah kolom list per kunjungan menjadi tabel baris (long format)**.
+
+Intinya:
+
+1.  Terima visit_ids, nama kolom urutan (seq_name), dan beberapa kolom list (...).
+
+2.  Untuk tiap kunjungan i:
+
+    -   Hitung panjang masing-masing list.
+
+    -   Ambil panjang maksimum n.
+
+    -   Kalau n = 0, kunjungan itu dilewati.
+
+3.  Buat tabel kecil:
+
+    -   visit_id
+
+    -   kolom urutan [1..n](app://-/index.html# "1..n") (mis. diagnosis_seq, treatment_seq, line_no)
+
+4.  Tiap list dimasukkan ke kolomnya:
+
+    -   Jika list lebih pendek dari n, sisanya diisi NA (padding).
+
+5.  Semua tabel kecil digabung jadi satu dengan rbindlist().
+
+Hasil akhirnya: **satu baris per item detail** (diagnosis/treatment/obat) per visit_id, siap untuk normalisasi 1NF/2NF.
+
+## 2. Cleaning
+
+#### a. Menentukan Kolom Karakter lalu dibersihkan
+
+```{r}
+char_cols <- names(dt)[vapply(dt, is.character, logical(1))]
+for (cc in char_cols) set(dt, j = cc, value = clean_text(dt[[cc]]))
+```
+
+-   vapply(dt, is.character, logical(1)) mengecek tiap kolom: apakah tipe character.
+
+-   char_cols berisi nama kolom teks saja.
+
+-   Loop for menjalankan clean_text() ke semua kolom teks.
+
+-   [set(dt, ...)](app://-/index.html# "set(dt, ...)") mengubah data **in-place** (lebih cepat, hemat memori).
+
+-   Efek clean_text: trim spasi dan ubah string kosong "" jadi NA.
+
+#### b. Standarisasi Nilai Kategori
+
+-   gender, doctor_gender menjadikan huruf besar (l/L jadi L).
+
+-   payment_method dipaksa huruf kecil (Cash/CASH jadi cash).
+
+-   patient_type dijadikan format title case (bpjs jadi Bpjs, umum jadi Umum).
+
+-   Tujuan: mencegah kategori ganda karena beda kapitalisasi.
+
+```{r}
+dt[, gender := toupper(gender)]
+dt[, doctor_gender := toupper(doctor_gender)]
+dt[, payment_method := tolower(payment_method)]
+dt[, patient_type := str_to_title(patient_type)]
+```
+
+#### c. Parsing Tanggal/Jam
+
+-   visit_datetime diubah ke tipe datetime dengan format hari/bulan/tahun jam:menit.
+
+-   clinic_open_date dan date_of_birth diubah ke tipe Date.
+
+-   Setelah ini, operasi waktu seperti filter rentang tanggal, agregasi bulanan, dll jadi akurat.
+
+```{r}
+dt[, visit_datetime := as.POSIXct(visit_datetime, format = "%d/%m/%Y %H:%M", tz = "Asia/Jakarta")]
+dt[, clinic_open_date := as.Date(clinic_open_date, format = "%d/%m/%Y")]
+dt[, date_of_birth := as.Date(date_of_birth, format = "%d/%m/%Y")]
+```
+
+#### d. Parsing Numerik 
+
+-   Kolom tinggi/berat diubah menjadi integer.
+
+-   Biaya administrasi dan konsultasi menjadi numerik.
+
+-   Tujuan: supaya bisa dihitung (sum, median, total_amount) tanpa error tipe data.
+
+```{r}
+dt[, height := as.integer(height)]
+dt[, weight := as.integer(weight)]
+dt[, administration_fee := as.numeric(administration_fee)]
+dt[, doctor_consultation_fee := as.numeric(doctor_consultation_fee)]
+```
+
+## 3. Data Wrangling
+
+-   Kolom seperti diagnosis, treatment, medicine\_\* asalnya string JSON, misal:
+
+    -   ["Nebulizer","Vitamin C"]
+
+    -   [10000,60000]
+
+-   [parse_json_col(...)](app://-/index.html# "parse_json_col(...)") mengubah tiap sel menjadi **vector/list R**.
+
+-   numeric = FALSE untuk teks.
+
+-   numeric = TRUE untuk angka.
+
+-   Hasil akhirnya adalah list per baris kunjungan, siap di-expand jadi tabel detail (visit_diagnosis, visit_treatment, visit_medicine) saat normalisasi 1NF–3NF.
+
+Ringkasnya: blok ini memastikan data sudah bersih, konsisten tipe, lalu struktur list-nya siap dipecah jadi tabel relasional.
+
+```{r}
+diagnosis_list <- parse_json_col(dt$diagnosis, numeric = FALSE)
+treatment_list <- parse_json_col(dt$treatment, numeric = FALSE)
+treatment_fee_list <- parse_json_col(dt$treatment_fee, numeric = TRUE)
+medicine_name_list <- parse_json_col(dt$medicine_name, numeric = FALSE)
+medicine_cat_list <- parse_json_col(dt$medicine_category, numeric = FALSE)
+medicine_price_list <- parse_json_col(dt$medicine_unit_price, numeric = TRUE)
+medicine_dose_list <- parse_json_col(dt$medicine_dosage_per_day, numeric = TRUE)
+medicine_dur_list <- parse_json_col(dt$medicine_duration_days, numeric = TRUE)
+```
+
+## 4. Normalisasi
+
+1.  **1NF (First Normal Form) : Merapikan bentuk**
+
+    -   Data harus atomik: tidak boleh ada list/array dalam satu sel.
+
+    -   Tidak ada repeating group dalam satu kolom.
+
+2.  **2NF (Second Normal Form)**
+
+    -   Sudah 1NF, lalu hilangkan **ketergantungan parsial** pada primary key gabungan.
+
+    -   Semua kolom non-key harus bergantung penuh pada seluruh key.
+
+3.  **3NF (Third Normal Form)**
+
+-   Sudah 2NF, lalu hilangkan **ketergantungan transitif** (non-key bergantung ke non-key lain).
+
+-   Atribut master dipisah ke entitas sendiri.
+
+#### a. Normalisasi 1NF
+
+```{r}
+nf1_visit <- unique(dt[, .(
+  visit_id, visit_datetime, clinic_name, clinic_city, clinic_province, clinic_open_date,
+  head_doctor_name_of_clinic, doctor_name, doctor_gender, doctor_specialty,
+  patient_name, gender, date_of_birth, height, weight, patient_city, patient_province,
+  patient_type, complaint, administration_fee, doctor_consultation_fee, payment_method
+)])
+
+nf1_visit_line <- build_list_table(
+  visit_ids = dt$visit_id,
+  seq_name = "line_no",
+  diagnosis_name = diagnosis_list,
+  treatment_name = treatment_list,
+  treatment_fee = treatment_fee_list,
+  medicine_name = medicine_name_list,
+  medicine_category = medicine_cat_list,
+  medicine_unit_price = medicine_price_list,
+  medicine_dosage_per_day = medicine_dose_list,
+  medicine_duration_days = medicine_dur_list
+)
+
+nf1_visit_line[, treatment_fee := as.numeric(treatment_fee)]
+nf1_visit_line[, medicine_unit_price := as.numeric(medicine_unit_price)]
+nf1_visit_line[, medicine_dosage_per_day := as.numeric(medicine_dosage_per_day)]
+nf1_visit_line[, medicine_duration_days := as.integer(medicine_duration_days)]
+```
+
+1.  Fungsi nf1_visit berfungsi untuk membuat tabel 1NF utama dengan mengambil kolom level kunjungan (visit, klinik, dokter, pasien, fee, payment). unique() digunakan untuk membuang duplikasi baris jika ada.
+
+    Fungsi ini akan memberikan output berupa 1 baris = 1 kunjungan tanpa list JSON
+
+2.  Fungsi nf1_visit_line untuk membuat tabel detail 1NF dengan mengubah kolom list (diagnosis, treatment,dll) menjadi baris-baris detail. 1 kunjungan bisa punya banyak baris detail (one to many)
+
+3.  as.numeric
+
+#### b. Normalisasi 2NF
+
+```{r}
+nf2_visit <- copy(nf1_visit)
+
+nf2_visit_diagnosis <- build_list_table(
+  visit_ids = dt$visit_id,
+  seq_name = "diagnosis_seq",
+  diagnosis_name = diagnosis_list
+)[!is.na(diagnosis_name)]
+
+nf2_visit_treatment <- build_list_table(
+  visit_ids = dt$visit_id,
+  seq_name = "treatment_seq",
+  treatment_name = treatment_list,
+  treatment_fee = treatment_fee_list
+)[!is.na(treatment_name)]
+
+nf2_visit_treatment[, treatment_fee := as.numeric(treatment_fee)]
+
+nf2_visit_medicine <- build_list_table(
+  visit_ids = dt$visit_id,
+  seq_name = "medicine_seq",
+  medicine_name = medicine_name_list,
+  medicine_category = medicine_cat_list,
+  medicine_unit_price = medicine_price_list,
+  medicine_dosage_per_day = medicine_dose_list,
+  medicine_duration_days = medicine_dur_list
+)[!is.na(medicine_name)]
+
+nf2_visit_medicine[, medicine_unit_price := as.numeric(medicine_unit_price)]
+nf2_visit_medicine[, medicine_dosage_per_day := as.numeric(medicine_dosage_per_day)]
+nf2_visit_medicine[, medicine_duration_days := as.integer(medicine_duration_days)]
+```
+
+Blok ini adalah tahap **normalisasi 2NF**: memecah detail kunjungan jadi tabel terpisah per jenis data.
+
+1.  nf2_visit \<- copy(nf1_visit)
+
+    -   Salin tabel header kunjungan dari 1NF.
+
+    -   Isinya atribut level kunjungan (visit, pasien, dokter, klinik, biaya dasar, dll).
+
+2.  nf2_visit_diagnosis \<- build_list_table(... diagnosis_name = diagnosis_list)[!is.na(diagnosis_name)]
+
+    -   Pecah list diagnosis per visit jadi baris.
+
+    -   diagnosis_seq = nomor urut diagnosis dalam satu visit.
+
+    -   Filter [!is.na(...)](app://-/index.html# "!is.na(...)") buang baris kosong.
+
+    -   Hasil: tabel detail diagnosis per kunjungan.
+
+3.  nf2_visit_treatment \<- build_list_table(... treatment_name, treatment_fee)[!is.na(treatment_name)]
+
+    -   Pecah list treatment + fee per visit.
+
+    -   treatment_seq = urutan treatment per visit.
+
+    -   Baris treatment kosong dibuang.
+
+4.  nf2_visit_treatment[, treatment_fee := as.numeric(treatment_fee)]
+
+    -   Pastikan fee treatment bertipe numerik untuk agregasi/perhitungan.
+
+5.  nf2_visit_medicine \<- build_list_table(... medicine\_\*)[!is.na(medicine_name)]
+
+    -   Pecah list obat per visit beserta kategori, harga, dosis, durasi.
+
+    -   medicine_seq = urutan obat per visit.
+
+    -   Baris obat kosong dibuang.
+
+6.  Konversi tipe numerik di tabel obat:
+
+-   medicine_unit_price jadi numeric
+
+-   medicine_dosage_per_day jadi numeric
+
+-   medicine_duration_days jadi integer
+
+Intinya:
+
+-   Sebelumnya detail diagnosis/treatment/obat masih “campur” dalam satu struktur besar.
+
+-   Di 2NF, detail dipisah ke 3 tabel child (nf2_visit_diagnosis, nf2_visit_treatment, nf2_visit_medicine) yang bergantung penuh pada key (visit_id, seq).
+
+-   Ini mengurangi ketergantungan parsial dan memudahkan lanjut ke 3NF.
+
+#### c. Normalisasi 3NF
+
+1.  **Clinic**
+
+```{r}
+clinic_cols <- c("clinic_name", "clinic_city", "clinic_province", "clinic_open_date", "head_doctor_name_of_clinic")
+nf3_clinic <- unique(nf2_visit[, ..clinic_cols])
+setorder(nf3_clinic, clinic_name, clinic_city, clinic_province, clinic_open_date, head_doctor_name_of_clinic)
+nf3_clinic[, clinic_id := sprintf("CLN%05d", .I)]
+clinic_fee <- nf2_visit[, .(administration_fee = safe_median(administration_fee)), by = clinic_cols]
+nf3_clinic <- merge(nf3_clinic, clinic_fee, by = clinic_cols, all.x = TRUE)
+setcolorder(nf3_clinic, c("clinic_id", clinic_cols, "administration_fee"))
+
+visit_enriched <- merge(
+  nf2_visit,
+  nf3_clinic[, c("clinic_id", clinic_cols), with = FALSE],
+  by = clinic_cols,
+  all.x = TRUE
+)
+```
+
+2.  **Doctor**
+
+    ```{r}
+    doctor_cols <- c("clinic_id", "doctor_name", "doctor_gender", "doctor_specialty")
+    nf3_doctor <- unique(visit_enriched[, ..doctor_cols])
+    setorder(nf3_doctor, clinic_id, doctor_name, doctor_gender, doctor_specialty)
+    nf3_doctor[, doctor_id := sprintf("DOC%06d", .I)]
+    doctor_fee <- visit_enriched[, .(doctor_consultation_fee = safe_median(doctor_consultation_fee)), by = doctor_cols]
+    nf3_doctor <- merge(nf3_doctor, doctor_fee, by = doctor_cols, all.x = TRUE)
+    setcolorder(nf3_doctor, c("doctor_id", "clinic_id", "doctor_name", "doctor_gender", "doctor_specialty", "doctor_consultation_fee"))
+
+    visit_enriched <- merge(
+      visit_enriched,
+      nf3_doctor[, .(doctor_id, clinic_id, doctor_name, doctor_gender, doctor_specialty)],
+      by = doctor_cols,
+      all.x = TRUE
+    )
+    ```
+
+3.  **Patient**
+
+    ```{r}
+    patient_cols <- c("patient_name", "gender", "date_of_birth", "height", "weight", "patient_city", "patient_province", "patient_type")
+    nf3_patient <- unique(visit_enriched[, ..patient_cols])
+    setorder(nf3_patient, patient_name, gender, date_of_birth, height, weight, patient_city, patient_province, patient_type)
+    nf3_patient[, patient_id := sprintf("PAT%07d", .I)]
+    setcolorder(nf3_patient, c("patient_id", patient_cols))
+
+    visit_enriched <- merge(
+      visit_enriched,
+      nf3_patient[, c("patient_id", patient_cols), with = FALSE],
+      by = patient_cols,
+      all.x = TRUE
+    )
+    ```
+
+4.  **Visit**
+
+    ```{r}
+    nf3_visit <- unique(visit_enriched[, .(visit_id, visit_datetime, clinic_id, doctor_id, patient_id, complaint)])
+    ```
+
+5.  **Diagnosis**
+
+    ```{r}
+    nf3_diagnosis <- unique(nf2_visit_diagnosis[, .(diagnosis_name)])
+    setorder(nf3_diagnosis, diagnosis_name)
+    nf3_diagnosis[, diagnosis_id := sprintf("DIA%05d", .I)]
+    setcolorder(nf3_diagnosis, c("diagnosis_id", "diagnosis_name"))
+
+    nf3_visit_diagnosis <- merge(
+      nf2_visit_diagnosis,
+      nf3_diagnosis,
+      by = "diagnosis_name",
+      all.x = TRUE
+    )[, .(visit_id, diagnosis_seq, diagnosis_id)]
+    ```
+
+6.  **Tretment**
+
+    ```{r}
+    nf3_treatment <- unique(nf2_visit_treatment[, .(treatment_name, treatment_fee)])
+    setorder(nf3_treatment, treatment_name, treatment_fee)
+    nf3_treatment[, treatment_id := sprintf("TRT%05d", .I)]
+    setcolorder(nf3_treatment, c("treatment_id", "treatment_name", "treatment_fee"))
+
+    nf3_visit_treatment <- merge(
+      nf2_visit_treatment,
+      nf3_treatment,
+      by = c("treatment_name", "treatment_fee"),
+      all.x = TRUE
+    )[, .(visit_id, treatment_seq, treatment_id)]
+    ```
+
+7.  **Medicine**
+
+    ```{r}
+    nf3_medicine <- unique(nf2_visit_medicine[, .(
+      medicine_name, medicine_category, medicine_unit_price,
+      medicine_dosage_per_day, medicine_duration_days
+    )])
+    setorder(nf3_medicine, medicine_name, medicine_category, medicine_unit_price, medicine_dosage_per_day, medicine_duration_days)
+    nf3_medicine[, medicine_id := sprintf("MED%06d", .I)]
+    setcolorder(nf3_medicine, c("medicine_id", "medicine_name", "medicine_category", "medicine_unit_price", "medicine_dosage_per_day", "medicine_duration_days"))
+
+    nf3_visit_medicine <- merge(
+      nf2_visit_medicine,
+      nf3_medicine,
+      by = c("medicine_name", "medicine_category", "medicine_unit_price", "medicine_dosage_per_day", "medicine_duration_days"),
+      all.x = TRUE
+    )[, .(visit_id, medicine_seq, medicine_id)]
+    ```
+
+8.  **Transactions**
+
+    ```{r}
+    treat_sum <- nf2_visit_treatment[, .(treatment_total = sum(treatment_fee, na.rm = TRUE)), by = visit_id]
+    med_sum <- nf2_visit_medicine[, .(
+      medicine_total = sum(medicine_unit_price * medicine_dosage_per_day * medicine_duration_days, na.rm = TRUE)
+    ), by = visit_id]
+
+    primary_diag <- nf3_visit_diagnosis[order(visit_id, diagnosis_seq), .SD[1], by = visit_id]
+    setnames(primary_diag, "diagnosis_id", "primary_diagnosis_id")
+
+    nf3_transactions <- unique(nf2_visit[, .(
+      visit_id, payment_method, administration_fee, doctor_consultation_fee
+    )])
+    nf3_transactions <- merge(nf3_transactions, treat_sum, by = "visit_id", all.x = TRUE)
+    nf3_transactions <- merge(nf3_transactions, med_sum, by = "visit_id", all.x = TRUE)
+    nf3_transactions <- merge(nf3_transactions, primary_diag[, .(visit_id, primary_diagnosis_id)], by = "visit_id", all.x = TRUE)
+
+    nf3_transactions[is.na(administration_fee), administration_fee := 0]
+    nf3_transactions[is.na(doctor_consultation_fee), doctor_consultation_fee := 0]
+    nf3_transactions[is.na(treatment_total), treatment_total := 0]
+    nf3_transactions[is.na(medicine_total), medicine_total := 0]
+
+    nf3_transactions[, total_amount := round(
+      administration_fee + doctor_consultation_fee + treatment_total + medicine_total, 2
+    )]
+    setorder(nf3_transactions, visit_id)
+    nf3_transactions[, transaction_id := .I]
+    nf3_transactions[, transaction_number := sprintf("TRX-%08d", transaction_id)]
+    setcolorder(nf3_transactions, c(
+      "transaction_id", "transaction_number", "visit_id", "primary_diagnosis_id",
+      "payment_method", "administration_fee", "doctor_consultation_fee",
+      "treatment_total", "medicine_total", "total_amount"
+    ))
+
+    ```
+
+LIST Visualisasi
+
+⁠**Analisis Operasional dan Pendapatan Klinik**
+
+•⁠ ⁠Total Revenue Per Wilayah: variabel treatment_fee, administration_fee, dan doctor_consultation_fee untuk melihat kota (clinic_city) atau provinsi mana yang menyumbang pendapatan tertinggi.\
+•⁠ ⁠Total Kunjungan: Total visit_id
+
+•⁠ ⁠Rasio Pasien: Perbandingan jumlah pasien BPJS vs Umum, asuransi dll berdasarkan variabel patient_type.
+
+1.  **Performa Klinik :**
+
+•⁠ ⁠(Heatmap) Pendapatan: Visualisasi wilayah (clinic_city atau clinic_province) dengan warna yang lebih gelap untuk area penyumbang pendapatan tertinggi.
+
+•⁠ ⁠Line Chart (Tren Kunjungan Pasien): Menampilkan fluktuasi kunjungan berdasarkan visit_datetime untuk mendeteksi jam/hari sibuk.
+
+•⁠ ⁠Pie Chart (Metode Pembayaran) : Distribusi penggunaan Cash, Debit, dan QRIS dari variabel payment_method.
+
+**2.⁠ ⁠Analisis profil dan Kesehatan Pasien**
+
+•⁠ ⁠Diagram piramida penduduk (Distribusi Demografi) : Gabung gender dan date_of_birth (hitung umur) untuk melihat segmen usia pasien yang paling sering datang (Anak-anak, Dewasa, atau Lansia).
+
+•⁠ ⁠Scatterplot (Korelasi Fisik (BMI): Hubungan antara height (tinggi) dan weight (berat) untuk melihat sebaran kesehatan fisik pasien.
+
+•⁠ ⁠Chloropleth map (Peta Sebaran Pasien) : Bandingkan patient_city dengan clinic_city untuk melihat apakah pasien berasal dari sekitar klinik atau ada yang melakukan perjalanan jauh
+
+**3.⁠ ⁠Analisis Medis dan Farmasi**
+
+•⁠ ⁠Bar Chart (Top 5 Diagnosa Penyakit) : Ekstrak data dari variabel diagnosis untuk melihat penyakit apa yang paling mewabah di lokasi tertentu.
+
+•⁠ ⁠Treemap (Analisis Stok Obat) : medicine_category untuk melihat kategori obat apa (misal: Antihistamin atau Vitamin) yang paling cepat habis.
+
+•⁠ ⁠Tabel (Produktivitas Dokter): Daftar doctor_name dan doctor_specialty dengan jumlah pasien tertinggi.

@@ -1,0 +1,649 @@
+---
+title: "identifikasi db klinik"
+format: html
+editor: visual
+---
+
+**Persiapan**
+
+```{r}
+library(readr)
+library(dplyr)
+library(tidyverse)
+```
+
+## Database
+
+Database (basis data) adalah **kumpulan data terstruktur yang disimpan secara elektronik di sistem komputer**. Data ini diatur dalam baris dan kolom (tabel) agar mudah diakses, dikelola, diperbarui, dan dikendalikan. Database digunakan untuk menyimpan informasi dalam jumlah besar, seperti daftar pelanggan atau transaksi, dengan efisien.
+
+## Data set
+
+dataset yang digunakan : **Dataset_Klinik_Raw.csv**
+
+```{r}
+df <- read_csv("dataset/Dataset_Klinik_Raw.csv")
+
+glimpse(df)
+
+```
+
+### Analisis Data Set
+
+#### 1. Cek Volume Data Set
+
+```{r}
+jumlah_baris  <- nrow(df)
+jumlah_kolom  <- ncol(df)
+ukuran_memori <- object.size(df)
+
+cat("Jumlah baris:", jumlah_baris, "\n")
+cat("Jumlah kolom:", jumlah_kolom, "\n")
+cat("Ukuran memori:", format(ukuran_memori, units = "MB"), "\n")
+```
+
+Dataset terdiri dari 307.188 baris dan 30 kolom dengan ukuran memori sebesar 113,8 Mb. Hal ini menjadi kurang efisien untuk proses yang berulang dikarenakan pengelolaan data berbasis file CSV mengharuskan pembacaan data secara penuh untuk setiap analisis
+
+#### 2. Cek Multi-Entitas
+
+```{r}
+nama_kolom <- names(df)
+nama_kolom
+
+# Distribusi tipe data
+tipe_kolom <- tibble(
+  kolom = names(df),
+  tipe  = map_chr(df, ~ paste(class(.x), collapse = ", "))
+)
+
+tipe_kolom %>% arrange(tipe)
+```
+
+Dari informasi di atas, diketahui bahwa dataset ini menggabungkan beberapa entitas (pasien, dokter, klinik, kunjungan, transaksi) dalam satu tabel dataset. sehingga **diperlukan database relasional**
+
+#### 3. Cek Redudansi (Pengulangan data master di banyak baris transaksi)
+
+```{r}
+has_col <- function(nm) nm %in% names(df)
+
+# contoh hitung entitas unik (sesuaikan nama kolom)
+ringkasan_unik <- tibble(
+  pasien = if (has_col("patient_name")) n_distinct(df$patient_name) else NA_integer_,
+  dokter = if (has_col("doctor_name"))  n_distinct(df$doctor_name)  else NA_integer_,
+  klinik = if (has_col("clinic_name"))  n_distinct(df$clinic_name)  else NA_integer_,
+)
+
+ringkasan_unik
+
+#Rasio pengulangan pasien (semakin tinggi => semakin kuat argumen DB)
+if (has_col("patient_name")) {
+  rasio_ulang_pasien <- 1 - (n_distinct(df$patient_name) / nrow(df))
+  cat("Rasio pengulangan nama pasien:", round(rasio_ulang_pasien, 4), "\n")
+}
+
+```
+
+Dari total baris/row dataset (307.188), kemunculan setiap entitas yang ada :
+
+-   Pasien : 79.316
+
+-   Dokter : 1.184
+
+-   Klinik : 87
+
+Dengan rasio pengulangan pada kolom patient_name sebesar **0,7418 (74,18%)**
+
+Hal ini menunjukkan sebesar 74% baris merupakan pengulangan nama pasien (bukan pasien baru) yang membuktikan **tingginya redudansi** data pasien.
+
+Tingginya redudansi data pasien menunjukkan bahwa data master (pasien) tersimpan berulang pada data kunjungan. Hal ini tentunya menyebabkan pemborosan penyimpanan, meningkatkan risiko inkonsistensi saat pembaruan data (misalnya perubahan alamat/tipe pasien), dan sulit menjamin integritas data jika tetap disimpan dalam bentuk CSV. Oleh karena itu, **diperlukan database relasional** dengan pemisah tabel master (pasien, dokter, klinik) dan tabel transaksi (visit) untuk normalisasi dan konsistensi.
+
+#### 4. Cek Relasi one-to-many
+
+```{r}
+# pasien -> jumlah kunjungan
+if (has_col("patient_name")) {
+  kunjungan_per_pasien <- df %>%
+    count(patient_name, name = "jumlah_kunjungan") %>%
+    summarise(
+      min = min(jumlah_kunjungan),
+      q1  = quantile(jumlah_kunjungan, 0.25),
+      median = median(jumlah_kunjungan),
+      mean = mean(jumlah_kunjungan),
+      q3  = quantile(jumlah_kunjungan, 0.75),
+      max = max(jumlah_kunjungan)
+    )
+  kunjungan_per_pasien
+}
+
+# dokter -> jumlah kunjungan
+if (has_col("doctor_name")) {
+  kunjungan_per_dokter <- df %>%
+    count(doctor_name, name = "jumlah_kunjungan") %>%
+    summarise(
+      min = min(jumlah_kunjungan),
+      q1  = quantile(jumlah_kunjungan, 0.25),
+      median = median(jumlah_kunjungan),
+      mean = mean(jumlah_kunjungan),
+      q3  = quantile(jumlah_kunjungan, 0.75),
+      max = max(jumlah_kunjungan)
+    )
+  kunjungan_per_dokter
+}
+
+```
+
+1.  Relasi Pasien -\> Kunjungan
+
+    -   Setiap pasien **minimal memiliki 1 kunjungan**, dan sebagian besar pasien melakukan **lebih dari satu kunjungan**.
+
+    -   25% pasien berkunjung sebanyak 2 kali
+
+    -   50% pasien berkunjung sebanyak 3 kali
+
+    -   rata2 pasien berkunjung sebanyak 3-4 kali
+
+    -   75% pasien berkunjung sebanyak 5 kali
+
+    -   Ada pasien dengan 28 kunjungan
+
+    -   Adanya pasien dengan hingga **28 kunjungan** mengindikasikan relasi **satu pasien ke banyak kunjungan (one-to-many)**.
+
+    Pasien merupakan entitas master yang direferensikan oleh banyak data kunjungan. Menyimpan seluruh informasi pasien berulang pada setiap baris kunjungan menyebabkan **redundansi tinggi,** sehingga secara konseptual data ini harus dipisahkan menjadi tabel `patient` dan tabel `visit` yang dihubungkan melalui foreign key.
+
+2.  Relasi Dokter -\> Kunjungan
+
+    -   Setiap dokter melayani **banyak kunjungan pasien**, bahkan dokter dengan jumlah kunjungan paling sedikit pun tetap memiliki lebih dari satu kunjungan.
+
+    -   Median dan rata-rata yang tinggi menunjukkan bahwa dokter adalah entitas yang **berulang secara masif** pada data kunjungan.
+
+    -   Nilai maksimum (2.083 kunjungan) memperkuat bahwa satu dokter dapat terkait dengan **ribuan transaksi kunjungan**.
+
+    Dokter merupakan entitas master dengan relasi one-to-many terhadap kunjungan. Oleh karena itu, informasi dokter seharusnya disimpan dalam tabel tersendiri dan direferensikan melalui foreign key pada tabel kunjungan, sehingga **dibutuhkan database relasional** untuk mengatasi hal ini
+
+#### 5. Normalisasi 1NF
+
+```{r}
+# deteksi kolom yang mengandung pola JSON array: "[" ... "]"
+is_repeating_group <- function(x) {
+  x <- x[!is.na(x)]
+  if (length(x) == 0) return(FALSE)
+  x <- x[1:min(2000, length(x))]
+  any(str_detect(as.character(x), "^\\["))
+}
+
+kolom_repeating <- names(df)[map_lgl(df, is_repeating_group)]
+kolom_repeating
+
+# ukur "berapa item per sel" untuk kolom repeating (estimasi cepat berbasis jumlah koma)
+count_items_rough <- function(x) {
+  x <- as.character(x)
+  x[is.na(x)] <- "[]"
+  x <- str_trim(x)
+
+  # [] -> 0
+  out <- ifelse(x == "[]", 0L, 1L + str_count(x, ","))
+  out
+}
+
+if (length(kolom_repeating) > 0) {
+  ringkas_repeating <- map_dfr(kolom_repeating, function(k) {
+    v <- df[[k]]
+    len <- count_items_rough(v)
+    tibble(
+      kolom = k,
+      mean_item = mean(len, na.rm = TRUE),
+      max_item  = max(len, na.rm = TRUE),
+      prop_gt1  = mean(len > 1, na.rm = TRUE)
+    )
+  })
+  ringkas_repeating
+}
+
+```
+
+**1NF (First Normal Form)** merupakan aturan paling dasar dalam normalisasi database. 1NF mensyaratkan bahwa setiap atribut dalam **tabel tidak mengandung kelompok berulang (repeating group)**, serta setiap record dapat diidentifikasi secara unik melalui primary key.
+
+Deteksi kolom “repeating group” (nilai berbentuk list/array `[...]`) menunjukkan adanya banyak item (misal diagnosis/tindakan/obat) dalam satu sel yang melanggar prinsip 1NF. Ini merupakan bukti kuat perlunya pemecahan ke tabel detail (line-item) yang dihubungkan dengan foreign key.
+
+Dalam 1NF, **setiap sel harus berisi 1 nilai (atomik)**.\
+Jika ada baris yang menyimpan **lebih dari 1 item** (misal obat lebih dari satu per kunjungan), maka itu **melanggar 1NF**dan harus dipindahkan ke tabel detail.
+
+1.  Diagnosis
+
+-   `mean_item = 1.12`
+
+-   `max_item = 2`
+
+-   `prop_gt1 = 0.1207` (≈ **12,07%** baris punya \>1 diagnosis)
+
+    Ada **sebagian** kunjungan yang memiliki **lebih dari satu diagnosis** hal ini menandakan indikasi repeating group.
+
+2.  Treatment & Treatment_fee
+
+-   `mean_item = 0.66`
+
+-   `max_item = 2`
+
+-   `prop_gt1 = 0.0313` (≈ **3,13%** baris punya \>1 tindakan)
+
+Walaupun proporsinya kecil, tetap ada kunjungan dengan **\>1 tindakan**.\
+Artinya treatment **bukan selalu 1 nilai per kunjungan** hal ini berpotensi melanggar 1NF.
+
+3.  semua kolom obat
+
+-   `mean_item = 1.893`
+
+-   `max_item = 3`
+
+-   `prop_gt1 = 0.7382` (≈ **73,82%** baris punya \>1 obat)\
+    Mayoritas kunjungan (hampir **3 dari 4 kunjungan**) berisi **lebih dari satu obat**.
+
+Berdasarkan hasil pengukuran `prop_gt1`, dataset **tidak memenuhi 1NF** untuk atribut diagnosis, tindakan, dan terutama obat, karena terdapat banyak baris yang menyimpan lebih dari satu nilai dalam satu kolom (non-atomik / repeating group).
+
+#### 6. Normalisasi 2NF
+
+memenuhi 1NF, tidak ada partial dependency terhadap pk
+
+```{r}
+
+
+# 2. Bersihkan dan pecah kolom treatment & treatment_fee
+df_treatment <- df %>%
+  mutate(
+    treatment = str_remove_all(treatment, '\\[|\\]|"'),
+    treatment_fee = str_remove_all(treatment_fee, "\\[|\\]")
+  ) %>%
+  mutate(
+    treatment = str_split(treatment, ",\\s*"),
+    treatment_fee = str_split(treatment_fee, ",\\s*")
+  ) %>%
+  unnest(cols = c(treatment, treatment_fee)) %>%
+  mutate(
+    treatment = str_trim(treatment),
+    treatment_fee = as.numeric(str_trim(treatment_fee))
+  ) %>%
+  filter(!is.na(treatment_fee), treatment != "")
+
+# 3. Cek jumlah fee unik per treatment
+cek_2NF <- df_treatment %>%
+  group_by(treatment) %>%
+  summarise(
+    jumlah_fee_unik = n_distinct(treatment_fee),
+    .groups = "drop"
+  )
+
+# 4. Treatment dengan lebih dari satu fee
+treatment_fee_berubah <- cek_2NF %>%
+  filter(jumlah_fee_unik > 1)
+
+# 5. Ringkasan hasil
+cat("Total treatment unik:", n_distinct(df_treatment$treatment), "\n")
+cat("Treatment dengan lebih dari satu fee:", nrow(treatment_fee_berubah), "\n")
+
+if(nrow(treatment_fee_berubah) == 0){
+  cat("Semua treatment memiliki satu fee tetap.\n")
+  cat("Artinya: treatment_fee hanya bergantung pada treatment_id.\n")
+  cat("Ada indikasi partial dependency → Belum memenuhi 2NF.\n")
+} else {
+  cat("Ada treatment dengan fee berbeda.\n")
+  cat("Artinya: treatment_fee bergantung pada visit_id dan treatment_id.\n")
+  cat("Sudah memenuhi 2NF.\n")
+}
+
+```
+
+sudah memenuhi 2NF
+
+#### 7. Normalisasi 3NF
+
+cek apakah doctor_consultation_fee bergantung ke doctor (bukan visit)
+
+```{r}
+cek_fee_doctor <- df %>%
+  group_by(doctor_name) %>%
+  summarise(n_fee = n_distinct(doctor_consultation_fee), .groups="drop") %>%
+  filter(n_fee > 1)
+
+cat("Dokter dengan fee berbeda:", nrow(cek_fee_doctor), "\n")
+
+```
+
+karena outputnya 0, maka fee cocok jadi atribut doctor (lebih 3NF)
+
+2.  Cek apakah clinic attributes bergantung pada clinic_name (bukan visit)
+
+```{r}
+cek_clinic <- df %>%
+  group_by(clinic_name) %>%
+  summarise(
+    n_city = n_distinct(clinic_city),
+    n_prov = n_distinct(clinic_province),
+    n_open = n_distinct(clinic_open_date),
+    .groups="drop"
+  ) %>%
+  filter(n_city > 1 | n_prov > 1 | n_open > 1)
+
+cat("Clinic_name yang tidak konsisten atributnya:", nrow(cek_clinic), "\n")
+
+```
+
+karena hasilnya 0, maka atribut klinik tepat di tabel clinic, bukan visit
+
+#### 6. Cek Inkonsistensi identitas
+
+```{r}
+if (has_col("patient_name") && has_col("date_of_birth")) {
+  name_to_dob <- df %>%
+    group_by(patient_name) %>%
+    summarise(jumlah_dob = n_distinct(date_of_birth), .groups = "drop") %>%
+    filter(jumlah_dob > 1) %>%
+    arrange(desc(jumlah_dob))
+
+  cat("Jumlah patient_name yang punya >1 DOB:", nrow(name_to_dob), "\n")
+  name_to_dob %>% slice_head(n = 10)
+}
+
+```
+
+Jumlah `patient_name` yang punya \>1 DOB: 37.766 nama. Artinya, ada 37.766 nama pasien yang muncul dengan tanggal lahir yang berbeda-beda di dalam dataset. Logika : 1 orang tidak mungkin punya lebih dari 1 tanggal lahir.
+
+### Kesimpulan
+
+Berdasarkan hasil eksplorasi dan analisis terhadap dataset klinik, dapat disimpulkan bahwa dataset :
+
+1.  Volume data besar
+
+2.  Banyak entitas digabung dalam 1 tabel (clinic, doctor, patient, visit, medichine, dll)
+
+3.  Redudansi data tinggi (74%)
+
+4.  Relasi one to many terbukti secara kuantitatif
+
+5.  Pelanggaran 1NF dibuktikan dengan analisis array \[...\]
+
+6.  Inkonsistensi identitas (patient_name memiliki banyak DOB)
+
+ini **tidak lagi sesuai dikelola sebagai file statis (CSV)** dan **memerlukan pemodelan dalam bentuk database relasional.**
+
+### Cek Kolom
+
+1.  **Kolom doctot_fee**
+
+```{r}
+
+#Total dokter unik
+total_dokter_unik <- df %>%
+  distinct(doctor_name) %>%
+  nrow()
+
+#jumlah nilai fee unik per dokter
+cek_fee_dokter <- df %>%
+  group_by(doctor_name) %>%
+  summarise(
+    jumlah_fee_unik = n_distinct(doctor_consultation_fee),
+    .groups = "drop"
+  )
+
+#Dokter dengan lebih dari satu nilai fee
+dokter_fee_berubah <- cek_fee_dokter %>%
+  filter(jumlah_fee_unik > 1)
+
+#Ringkasan hasil
+cat("Total dokter unik:", total_dokter_unik, "\n")
+cat("Dokter dengan lebih dari satu nilai fee:", nrow(dokter_fee_berubah), "\n")
+
+if (nrow(dokter_fee_berubah) == 0) {
+  cat("Artinya: 100% dokter konsisten dengan satu nominal fee.\n")
+} else {
+  cat("Artinya : Ada dokter dengan fee yang berubah-ubah.\n")
+}
+
+```
+
+*kolom fee bisa menjadi atribut dari dokter*
+
+2.  **kolom treatment_fee**
+
+```{r}
+library(readr)
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(purrr)
+
+
+# 2. Ubah kolom treatment dan treatment_fee dari format string array menjadi list
+df_clean <- df %>%
+  mutate(
+    treatment = str_remove_all(treatment, "\\[|\\]|\""),
+    treatment_fee = str_remove_all(treatment_fee, "\\[|\\]")
+  ) %>%
+  mutate(
+    treatment = str_split(treatment, ",\\s*"),
+    treatment_fee = str_split(treatment_fee, ",\\s*")
+  )
+
+# 3. Pecah jadi baris terpisah (unnest)
+df_treatment <- df_clean %>%
+  unnest(cols = c(treatment, treatment_fee)) %>%
+  filter(treatment != "") %>%
+  mutate(treatment_fee = as.numeric(treatment_fee))
+
+# 4. Cek apakah setiap treatment punya lebih dari 1 harga
+cek_harga_treatment <- df_treatment %>%
+  group_by(treatment) %>%
+  summarise(
+    jumlah_harga_unik = n_distinct(treatment_fee),
+    .groups = "drop"
+  )
+
+# 5. Tampilkan treatment yang punya harga berbeda
+treatment_harga_berbeda <- cek_harga_treatment %>%
+  filter(jumlah_harga_unik > 1)
+
+# 6. Ringkasan hasil
+cat("Total treatment unik:", n_distinct(df_treatment$treatment), "\n")
+cat("Treatment dengan lebih dari satu harga:", nrow(treatment_harga_berbeda), "\n")
+
+if(nrow(treatment_harga_berbeda) == 0){
+  cat("Artinya: Semua treatment memiliki harga yang konsisten.\n")
+} else {
+  cat("Ada treatment yang memiliki harga berbeda.\n")
+}
+
+```
+
+```{r}
+library(readr)
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(purrr)
+
+
+
+# Pecah kolom array treatment & treatment_fee
+df_treatment <- df %>%
+  mutate(
+    treatment = str_remove_all(treatment, '\\[|\\]|"'),
+    treatment_fee = str_remove_all(treatment_fee, "\\[|\\]")
+  ) %>%
+  mutate(
+    treatment = str_split(treatment, ",\\s*"),
+    treatment_fee = str_split(treatment_fee, ",\\s*")
+  ) %>%
+  unnest(cols = c(treatment, treatment_fee)) %>%
+  mutate(
+    treatment = str_trim(treatment),
+    treatment_fee = as.numeric(str_trim(treatment_fee))
+  ) %>%
+  filter(!is.na(treatment_fee), treatment != "")
+
+# Ringkasan fee per treatment (unik)
+treatment_fee_check <- df_treatment %>%
+  group_by(treatment) %>%
+  summarise(
+    n_fee_unik = n_distinct(treatment_fee),
+    daftar_fee = paste(sort(unique(treatment_fee)), collapse = ", "),
+    fee_konsisten = ifelse(n_fee_unik == 1, "YA", "TIDAK"),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(n_fee_unik), treatment)
+
+# Tampilkan hasil
+treatment_fee_check
+
+```
+
+### Database
+
+Langkah-Langkah menyusun database *(Ramez Elmasri & Shamkant B. Navathe)*:
+
+1.  *Requirements Analysis*
+
+2.  Identifikasi Entitas dan Atribut
+
+3.  Penetuan Primary Key dan Foreign Key
+
+4.  Perancangan Konseptual (ERD)
+
+5.  Perancangan Logis Database
+
+Implementasi Dataset ke dalam database dengan mengikuti langkah-langkah di atas :
+
+#### *1. Requirements Analysis*
+
+Pada tahapan ini dilakukan analisis kebutuhan. dengan **mengidentifikasi** business function dan entitas.
+
+Berdasarkan dataset, business function yang teridentifikasi:
+
+-   Manajemen Klinik : *mengelola data klinik*
+
+-   Manajemen Dokter : *mengelola data dokter*
+
+-   Manajemen Pasien : *mengelola data pasien*
+
+-   Manajemen Obat : *mengelola data obat*
+
+-   Pencatatan Kunjungan Pasien : *mencatat kunjungan pasien ke klinik pada waktu tertentu (tambahkan complaint)*
+
+-   Pemeriksaan dan Diagnosa : *mencatat keluhan dan hasil diagnosa pada kunjungan*
+
+-   Pembayaran tagihan: *invoice*
+
+| Business Function | Clinic | Doctor | Patient | visit | treatment | Diagnosis | medicine | transaction |
+|----|----|----|----|----|----|----|----|----|
+| Manajemen Klinik | x |  |  |  |  |  |  |  |
+| Manajemen Dokter | x | x |  |  |  |  |  |  |
+| Manajemen Pasien |  |  | x |  |  |  |  |  |
+| Manajemen Obat |  |  |  |  |  |  | x |  |
+| Manajemen Treatment |  |  |  |  | x |  |  |  |
+| Pencatatan Kunjungan Pasien | x | x | x | x |  |  |  |  |
+| Pemeriksaan dan Diagnosa | x | x | x | x | x | x | x |  |
+| Pembayaran tagihan | x | x | x | x | x | x | x | x |
+
+#### 2. Identifikasi Entitas dan Atribut dan Penentuan Key
+
+Berdasarkan dataset, **Entitas** yang ada :
+
+1.  Clinic
+2.  Doctor
+3.  Patient
+4.  Visit
+5.  Treatment
+6.  Medicine
+7.  Transaction
+
+Berdasarkan dataset, **Atribut** yang ada :
+
+1.  visit_id
+2.  visit_datetime
+3.  clinic_name
+4.  clinic_city
+5.  clinic_province
+6.  clinic_open_date
+7.  head_doctor_name_of_clinic
+8.  doctor_name
+9.  doctor_gender
+10. doctor_specialty
+11. patient_name
+12. gender
+13. date_of_birth
+14. height
+15. weight
+16. patient_city
+17. patient_province
+18. patient_type
+19. complaint
+20. diagnosis
+21. treatment
+22. treatment_fee
+23. medicine_name
+24. medicine_category
+25. medicine_unit_price
+26. medicine_dosage_per_day
+27. medicine_duration_days
+28. administration_fee
+29. doctor_consultation_fee
+30. payment_method
+
+kemudian dilakukan identifikasi untuk atribut serta key setiap entitas yang ada
+
+| Entitas     | Atribut                 |
+|-------------|-------------------------|
+| clinic      | **clinic_id (PK)**      |
+|             | clinic_name             |
+|             | clinic_city             |
+|             | clinic_province         |
+|             | clinic_open_date        |
+|             | administration_fee      |
+| doctor      | **doctor_id (PK)**      |
+|             | **clinic_id (FK)**      |
+|             | doctor_name             |
+|             | doctor_gender           |
+|             | doctor_specialty        |
+|             | doctor_consultation_fee |
+| patient     | **patient_id (PK)**     |
+|             | patient_name            |
+|             | gender                  |
+|             | date_of_birth           |
+|             | height                  |
+|             | weight                  |
+|             | patient_city            |
+|             | patient_province        |
+|             | patient_type            |
+| visit       | **visit_id (PK)**       |
+|             | **doctor_id (FK)**      |
+|             | **clinic_id (FK)**      |
+|             | **patient_id (FK)**     |
+|             | visit_datetime          |
+|             | complaint               |
+| treatment   | **treatment_id (PK)**   |
+|             | treatment_name          |
+|             | treatment_fee           |
+| diagnosis   | **diagnosis_id (PK)**   |
+|             | **doctor_id (FK)**      |
+|             | **visit_id (FK)**       |
+|             | **clinic_id (FK)**      |
+|             | **patient_id (FK)**     |
+|             | **medicine_id (FK)**    |
+|             | **treatment_id (FK)**   |
+|             | diagnosis_name          |
+| medicine    | **medicine_id (PK)**    |
+|             | medicine_name           |
+|             | medicine_category       |
+|             | medicine_unit_price     |
+|             | medicine_dosage_per_day |
+|             | medicine_duration_days  |
+| transaction | **transaction_id (PK)** |
+|             | transaction_number      |
+|             | **diagnosis_id (FK)**   |
+|             | total_amount            |
+|             | payment_method          |
+
+#### 3. Perancangan Konseptual (ERD)
+
+![](images/Untitled%20Diagram.drawio.pdf)
+
+![](images/Image%2011-02-26%20at%2008.25.png){fig-align="center" width="758"}
+
+![](images/Image%2011-02-26%20at%2008.24.png){fig-align="center" width="797"}
