@@ -9,3 +9,6 @@
 *.sqlite3
 output/
 !output/sql/
+data/raw/Dataset_Klinik_Raw.csv
+dataset/Dataset_Klinik_Raw.csv
+scripts/dataset/Dataset_Klinik_Raw.csv
